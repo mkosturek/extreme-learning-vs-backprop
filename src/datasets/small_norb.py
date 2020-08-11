@@ -8,6 +8,11 @@ from os.path import join
 from os.path import exists
 from itertools import groupby
 
+import torch
+import torch.utils.data as data
+import cv2
+from torchvision import transforms
+
 
 class SmallNORBExample:
 
@@ -79,7 +84,7 @@ class SmallNORBDataset:
         }
 
         # Fill data structures parsing dataset binary files
-        for data_split in ['train', 'test']:
+        for data_split in ['train',  'test']:
             self._fill_data_structures(data_split)
 
         self.initialized = True
@@ -342,3 +347,84 @@ class SmallNORBDataset:
                     examples[r, c] = info
 
         return examples
+
+
+class SmallNORBPytorchDataset(data.Dataset):
+    
+    def __init__(self, root, image_set, transform=None, transform_target=None,
+                 size=(96,96)):
+        self.dataset = SmallNORBDataset(root)
+        self.image_set = image_set
+
+        self.transform = transform
+        self.transform_target = transform_target
+        self.size = size
+
+    def __getitem__(self, index):
+        example = self.dataset.data[self.image_set][index]
+        x = cv2.resize(example.image_lt / 255, self.size)
+        x = x[np.newaxis, ...]
+        x = torch.from_numpy(x).float()
+        y = torch.LongTensor([example.category]).squeeze()
+        
+        if self.transform:
+            x = self.transform(x)
+        if self.transform_target:
+            y = self.transform_target(y)
+        
+        return x, y
+
+    def __len__(self):
+        return len(self.dataset.data[self.image_set])
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
+
+
+class Standardize(object):
+    """ Standardizes a 'PIL Image' such that each channel
+        gets zero mean and unit variance. """
+    def __call__(self, img):
+        return (img - img.mean(dim=(1,2), keepdim=True)) \
+            / torch.clamp(img.std(dim=(1,2), keepdim=True), min=1e-8)
+
+    def __repr__(self):
+        return self.__class__.__name__ + '()'
+
+
+class SmallNORBCenterCropDataset(data.Dataset):
+ 
+    def __init__(self, root, image_set, transform_target=None,
+                 size=(48,48)):
+        self.dataset = SmallNORBDataset(root)
+        self.image_set = image_set
+
+        self.transform = transforms.Compose([
+                transforms.ToPILImage(),
+                transforms.CenterCrop((32,32)),
+                transforms.ToTensor(),
+                Standardize()])
+        self.transform_target = transform_target
+        self.size = size
+
+    def __getitem__(self, index):
+        example = self.dataset.data[self.image_set][index]
+        left = cv2.resize(example.image_lt, self.size)[..., np.newaxis]
+        right = cv2.resize(example.image_rt, self.size)[..., np.newaxis]
+        x = np.concatenate([left, right], axis=-1)
+        y = torch.LongTensor([example.category]).squeeze()
+        
+        x = self.transform(x)
+        
+        if self.transform_target:
+            y = self.transform_target(y)
+        
+        return x, y
+
+    def __len__(self):
+        return len(self.dataset.data[self.image_set])
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]

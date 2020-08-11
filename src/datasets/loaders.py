@@ -17,6 +17,7 @@ import torchvision.transforms as tvt
 from src.datasets.small_norb import SmallNORBDataset
 from skimage.feature import hog
 import pickle
+from src.datasets.pcam_dataset import PatchCamelyonDataset
 
 
 DATA_PATH = os.path.dirname(os.path.abspath(__file__)) + '/../../data/'
@@ -239,6 +240,20 @@ def load_norb(size=(96,96)):
     return X, y
 
 
+def load_patch_camelyon():
+    train_pcam = PatchCamelyonDataset("/mnt/SAMSUNG/datasets/patch_camelyon/", "train")
+    valid_pcam = PatchCamelyonDataset("/mnt/SAMSUNG/datasets/patch_camelyon/", "valid")
+    test_pcam = PatchCamelyonDataset("/mnt/SAMSUNG/datasets/patch_camelyon/", "test")
+    X, y = [], []
+    for image, target in chain(train_pcam, valid_pcam, test_pcam):
+        X.append(image.numpy() / 255)
+        y.append(target.numpy().astype(int))
+    
+    X = np.stack(X)
+    y = np.asarray(y)
+    return X, y
+
+
 def _hog_extractor(X, orientations=9,
                    pixels_per_cell=(8, 8),
                    cells_per_block=(3, 3)):
@@ -294,3 +309,5 @@ def load_hog_norb():
         X, y = load_norb()
         X = _hog_extractor(X)
     return X, y
+
+

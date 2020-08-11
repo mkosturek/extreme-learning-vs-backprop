@@ -16,10 +16,12 @@ class ELM(nn.Module):
         self.is_initialised = False
         self.nb_classes = nb_classes
 
-    def initialise_out_layer(self, hidden_dim, bias=False, device='cpu'):
+    def initialise_out_layer(self, hidden_dim, bias=False, device='cpu', softmax=False):
         self.out_layer = torch.nn.Linear(hidden_dim,
                                          self.nb_classes,
                                          bias=bias).to(device)
+        if softmax:
+            self.out_layer = nn.Sequential(self.out_layer, nn.Softmax())
         self.is_initialised = True
 
     def initialise_xavier_normal(self, hidden_dim):

@@ -9,6 +9,7 @@ from torch import optim
 from torch.utils.data.dataset import TensorDataset
 from torch.utils.data.dataloader import DataLoader
 import tqdm
+from torch import nn
 
 
 class ModelConfigTrainer:
@@ -27,6 +28,9 @@ class ModelConfigTrainer:
     def train_model_measure_time(self, X, y):
         raise NotImplementedError
 
+    def train_with_dataloader_measure_time(self, data_loader: DataLoader):
+        raise NotImplementedError
+
     def config_dict(self):
         return {k: v
                 for k, v in vars(self).items()
@@ -41,7 +45,7 @@ class ElmConfigTrainer(ModelConfigTrainer):
         self.hidden_dim = hidden_dim
         self.activation_fn = activation_fn
         self.C = C
-        self.try_pinverse=try_pinverse
+        self.try_pinverse = try_pinverse
 
         self._model: ELM = None
         self._ela: ExtremeLearningAlgorithm = None
@@ -62,7 +66,7 @@ class ElmConfigTrainer(ModelConfigTrainer):
         self._model = self.build_elm().to(device)
         self._ela = self.build_ela()
 
-    def set_validation_data(self, X_val, y_val):
+    def set_validation_data(self, X_val=None, y_val=None, dataset_val=None):
         pass
 
     def train_model_measure_time(self, X, y):
@@ -74,20 +78,32 @@ class ElmConfigTrainer(ModelConfigTrainer):
                         try_pinverse=self.try_pinverse)
         toc = time.time()
 
-        return self._model, (toc - tic)
+        return self._model, (toc - tic), False
+
+    def train_with_dataloader_measure_time(self, data_loader):
+        if self._model is None or self._ela is None:
+            self.build_model()
+
+        tic = time.time()
+        self._ela.train_data_loader(self._model, data_loader,
+                                    try_pinverse=self.try_pinverse)
+        toc = time.time()
+
+        return self._model, (toc - tic), False
 
 
 class LrfConfigTrainer(ModelConfigTrainer):
 
     def __init__(self, dataset_name, in_channels, out_dim, out_channels,
                  conv_kernel_size, pool_size,
-                 C, try_pinverse=False):
+                 C, pool_stride=2, try_pinverse=False):
         super().__init__(dataset_name, in_channels, out_dim, 'ELM')
         self.conv_kernel_size = conv_kernel_size
         self.out_channels = out_channels
         self.pool_size = pool_size
         self.C = C
         self.try_pinverse = try_pinverse
+        self.pool_stride = pool_stride
 
         self._model: ELM = None
         self._ela: ExtremeLearningAlgorithm = None
@@ -98,7 +114,8 @@ class LrfConfigTrainer(ModelConfigTrainer):
     def build_elm(self):
         return ELM(LocalReceptiveField(self.in_dim, self.out_channels,
                                        conv_kernel_size=self.conv_kernel_size,
-                                       pool_kernel_size=self.pool_size),
+                                       pool_kernel_size=self.pool_size,
+                                       pool_stride=self.pool_stride),
                    nb_classes=self.out_dim)
 
     def build_ela(self):
@@ -109,7 +126,7 @@ class LrfConfigTrainer(ModelConfigTrainer):
         self._model.H.orthogonalise_kernels()
         self._ela = self.build_ela()
 
-    def set_validation_data(self, X_val, y_val):
+    def set_validation_data(self, X_val=None, y_val=None, dataset_val=None):
         pass
 
     def train_model_measure_time(self, X, y):
@@ -121,7 +138,18 @@ class LrfConfigTrainer(ModelConfigTrainer):
                         try_pinverse=self.try_pinverse)
         toc = time.time()
 
-        return self._model, (toc - tic)
+        return self._model, (toc - tic), False
+
+    def train_with_dataloader_measure_time(self, data_loader):
+        if self._model is None or self._ela is None:
+            self.build_model()
+
+        tic = time.time()
+        self._ela.train_data_loader(self._model, data_loader,
+                                    try_pinverse=self.try_pinverse)
+        toc = time.time()
+
+        return self._model, (toc - tic), False
 
 
 class MLPConfigTrainer(ModelConfigTrainer):
@@ -131,7 +159,9 @@ class MLPConfigTrainer(ModelConfigTrainer):
                  activation_fn, C,
                  loss_fn, batch_size,
                  optimiser, learning_rate,
-                 max_epochs, patience):
+                 max_epochs, patience,
+                 nb_layers=1,
+                 softmax=False):
         super().__init__(dataset_name, in_dim, out_dim, 'MLP')
         self.hidden_dim = hidden_dim
         self.activation_fn = activation_fn
@@ -142,25 +172,43 @@ class MLPConfigTrainer(ModelConfigTrainer):
         self.optimiser = optimiser
         self.patience = patience
         self.epochs = max_epochs
+        self.softmax = softmax
 
+        self.nb_layers = nb_layers
+        
         self._model: ELM = None
-        self._X_val = None
-        self._y_val = None
+        self._dataset_val = None
         self._device: str = 'cpu'
 
     def __getitem__(self, key):
         return vars(self)[key]
 
-    def set_validation_data(self, X_val, y_val):
-        self._X_val = X_val
-        self._y_val = y_val
+    def set_validation_data(self, X_val=None, y_val=None, dataset_val=None):
+        if X_val is not None and y_val is not None:
+            self._dataset_val = TensorDataset(X_val, y_val)
+        elif dataset_val is not None:
+            self._dataset_val = dataset_val
+        else:
+            raise RuntimeError()
 
     def build_model(self, device='cpu'):
-        self._model = ELM(base_extractor(in_dim=self.in_dim,
-                                         hidden_dim=self.hidden_dim,
-                                         activation_fn=self.activation_fn),
-                          nb_classes=self.out_dim)
-        self._model.initialise_out_layer(self.hidden_dim, bias=True)
+        if self.nb_layers <= 1:
+            self._model = ELM(base_extractor(in_dim=self.in_dim,
+                                            hidden_dim=self.hidden_dim,
+                                            activation_fn=self.activation_fn),
+                            nb_classes=self.out_dim)
+        else:
+            extractor = base_extractor(in_dim=self.in_dim,
+                                            hidden_dim=self.hidden_dim,
+                                            activation_fn=self.activation_fn)
+            sequence = [extractor]
+            for i in range(self.nb_layers - 1):
+                sequence.append(nn.Linear(self.hidden_dim, self.hidden_dim))
+                sequence.append(self.activation_fn())
+            
+            extractor = nn.Sequential(*sequence)
+            self._model = ELM(extractor, nb_classes=self.out_dim)
+        self._model.initialise_out_layer(self.hidden_dim, bias=True, softmax=self.softmax)
         self._model = self._model.to(device)
         self._device = device
 
@@ -168,23 +216,38 @@ class MLPConfigTrainer(ModelConfigTrainer):
         if self._model is None:
             self.build_model()
 
-        dataset = TensorDataset(X.to(self._device), y)
+        dataset = TensorDataset(X, y)
+        return self._train_with_dataset(dataset)
+
+    def train_with_dataloader_measure_time(self, data_loader):
+        if self._model is None:
+            self.build_model()
+
+        dataset = data_loader.dataset
+        return self._train_with_dataset(dataset)
+
+    def _train_with_dataset(self, dataset):
         dataloader = DataLoader(dataset, self.batch, shuffle=True)
         optimiser = self.optimiser(params=self._model.parameters(),
                                    lr=self.lr, weight_decay=self.C)
         early_stopper = EarlyStopping(self.patience,
                                       lambda out, y: -self.loss_fn(out, y),
-                                      self._X_val, self._y_val)
+                                      self._dataset_val,
+                                      self._device)
 
         tic = time.time()
 
         for ep in range(self.epochs):
             for inputs, targets in dataloader:
+                inputs = inputs.to(self._device)
+                targets = targets.to(self._device)
                 optimiser.zero_grad()
 
                 # forward + backward + optimize
                 response = self._model(inputs)
                 loss = self.loss_fn(response, targets)
+                if torch.isnan(loss):
+                    return self._model, time.time() - tic, True
                 loss.backward()
                 optimiser.step()
 
@@ -192,7 +255,7 @@ class MLPConfigTrainer(ModelConfigTrainer):
                 break
         toc = time.time()
 
-        return self._model, (toc - tic)
+        return self._model, (toc - tic), False
 
 
 class CNNConfigTrainer(ModelConfigTrainer):
@@ -202,11 +265,13 @@ class CNNConfigTrainer(ModelConfigTrainer):
                  conv_kernel_size, pool_size,
                  C, loss_fn, batch_size,
                  optimiser, learning_rate,
-                 max_epochs, patience, device='cpu', verbose=False):
+                 max_epochs, patience, pool_stride=2,
+                 device='cpu', verbose=False):
         super().__init__(dataset_name, in_channels, out_dim, 'CNN')
         self.conv_kernel_size = conv_kernel_size
         self.out_channels = out_channels
         self.pool_size = pool_size
+        self.pool_stride = pool_stride
         self.C = C
         self.loss_fn = loss_fn()
         self.batch = batch_size
@@ -216,8 +281,8 @@ class CNNConfigTrainer(ModelConfigTrainer):
         self.epochs = max_epochs
 
         self._model: ELM = None
-        self._X_val = None
-        self._y_val = None
+        self._dataset_val = None
+
         self._device: str = device
         self._verbose: bool = verbose
 
@@ -225,7 +290,8 @@ class CNNConfigTrainer(ModelConfigTrainer):
         self._model = ELM(LocalReceptiveField(self.in_dim,
                                               self.out_channels,
                                               conv_kernel_size=self.conv_kernel_size,
-                                              pool_kernel_size=self.pool_size),
+                                              pool_kernel_size=self.pool_size,
+                                              pool_stride=self.pool_stride),
                           nb_classes=self.out_dim).to(device)
 
         self._model = self._model.to(device)
@@ -235,19 +301,30 @@ class CNNConfigTrainer(ModelConfigTrainer):
         if self._model is None:
             self.build_model(self._device)
 
-        with torch.no_grad(): # for initialisation of last layer
+        with torch.no_grad():  # for initialisation of last layer
             _ = self._model.forward(X[:1].to(self._device))
 
-        dataset = TensorDataset(X.to(self._device), y)
-        dataloader = DataLoader(dataset, self.batch, shuffle=True)
+        dataset = TensorDataset(X, y)
+        return self._train_with_dataset(dataset)
+
+    def train_with_dataloader_measure_time(self, data_loader):
+        if self._model is None:
+            self.build_model(self._device)
+        return self._train_with_dataset(data_loader.dataset)
+
+    def _train_with_dataset(self, dataset):
+        dataloader = DataLoader(dataset, self.batch,
+                                shuffle=True, num_workers=1)
         optimiser = self.optimiser(params=self._model.parameters(),
                                    lr=self.lr, weight_decay=self.C)
         early_stopper = EarlyStopping(self.patience,
                                       lambda out, y: -self.loss_fn(out, y),
-                                      self._X_val, self._y_val)
+                                      self._dataset_val,
+                                      self._device)
 
         tic = time.time()
-        pbar = tqdm.tqdm_notebook(range(self.epochs), disable=not self._verbose)
+        pbar = tqdm.tqdm_notebook(
+            range(self.epochs), disable=not self._verbose)
         for ep in pbar:
             for inputs, targets in dataloader:
                 inputs = inputs.to(self._device)
@@ -257,37 +334,53 @@ class CNNConfigTrainer(ModelConfigTrainer):
                 # forward + backward + optimize
                 response = self._model(inputs)
                 loss = self.loss_fn(response, targets)
+                if torch.isnan(loss):
+                    return self._model, time.time() - tic, True
                 loss.backward()
                 optimiser.step()
-                pbar.set_postfix({"epoch": ep, "loss": loss.detach().cpu().item()})
+            pbar.set_postfix({"epoch": ep, "loss": loss.detach().cpu().item()})
 
             if early_stopper.should_stop(self._model):
                 break
         toc = time.time()
 
-        return self._model, (toc - tic)
+        return self._model, (toc - tic), False
 
-    def set_validation_data(self, X_val, y_val):
-        self._X_val = X_val.to(self._device)
-        self._y_val = y_val.to(self._device)
+    def set_validation_data(self, X_val=None, y_val=None, dataset_val=None):
+        if X_val is not None and y_val is not None:
+            self._dataset_val = TensorDataset(X_val, y_val)
+        elif dataset_val is not None:
+            self._dataset_val = dataset_val
+        else:
+            raise RuntimeError()
 
 
 class EarlyStopping:
 
-    def __init__(self, patience, score_function, X_val, y_val):
+    def __init__(self, patience, score_function, dataset=None, device='cpu'):
         if patience < 1:
             raise ValueError("Argument patience should be positive integer.")
 
         self.score_function = score_function
         self.patience = patience
-        self.X_val = X_val
-        self.y_val = y_val
+        self.data_loader = DataLoader(dataset, batch_size=2048)
         self.counter = 0
         self.best_score = None
+        self.device = device
 
+    @torch.no_grad()
     def should_stop(self, model: nn.Module):
-        resp = model(self.X_val)
-        score = self.score_function(resp, self.y_val)
+        resp = []
+        y = []
+        for X, Y in self.data_loader:
+            X = X.to(self.device)
+            Y = Y.to(self.device)
+            resp.append(model(X))
+            y.append(Y)
+
+        resp = torch.cat(resp)
+        y = torch.cat(y)
+        score = self.score_function(resp, y)
 
         if self.best_score is None:
             self.best_score = score
